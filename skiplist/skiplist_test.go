@@ -224,6 +224,38 @@ func TestBuilder(t *testing.T) {
 
 }
 
+func TestPrevIterator(t *testing.T) {
+	s := New()
+	cmp := CompareInt
+	buf := s.MakeBuf()
+	defer s.FreeBuf(buf)
+
+	n := 10230
+	for i := 0; i < n; i++ {
+		s.Insert(NewIntKeyItem(i), cmp, buf, &s.Stats)
+	}
+	fmt.Println("Inserted items:", n)
+
+	// Reverse iterate from end to beginning (endLim > all keys so we start at last node)
+	endLim := NewIntKeyItem(n)
+	itr := s.NewPrevIterator(nil, endLim, cmp, buf)
+	fmt.Println("Created reverse iterator")
+
+	count := 0
+	for itr.Valid() {
+		got := IntFromItem(itr.Get())
+		expected := n - 1 - count
+		fmt.Println("At step", count, "expected", expected, "got", got)
+		if got != expected {
+			t.Errorf("at step %d: expected %d, got %d", count, expected, got)
+		}
+		count++
+		itr.Prev()
+	}
+	if count != n {
+		t.Errorf("expected %d elements, got %d", n, count)
+	}
+}
 func TestNodeDCAS(t *testing.T) {
 	level := 0
 

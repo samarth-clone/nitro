@@ -13,12 +13,13 @@ import "unsafe"
 
 // Iterator is used for lookup and range operations on skiplist
 type Iterator struct {
-	cmp        CompareFn
-	s          *Skiplist
-	prev, curr *Node
-	valid      bool
-	buf        *ActionBuffer
-	deleted    bool
+	cmp           CompareFn
+	s             *Skiplist
+	prev, curr    *Node
+	valid         bool
+	buf           *ActionBuffer
+	deleted       bool
+	isReverseIter bool
 
 	bs          *BarrierSession
 	count       uint
@@ -76,10 +77,15 @@ func (it *Iterator) Seek(itm unsafe.Pointer) bool {
 
 // Valid returns true when iterator reaches the end
 func (it *Iterator) Valid() bool {
-	if it.valid && it.curr == it.s.tail {
-		it.valid = false
+	if it.isReverseIter {
+		if it.valid && it.curr == it.s.head {
+			it.valid = false
+		}
+	} else {
+		if it.valid && it.curr == it.s.tail {
+			it.valid = false
+		}
 	}
-
 	return it.valid
 }
 
@@ -97,6 +103,9 @@ func (it *Iterator) GetNode() *Node {
 func (it *Iterator) Next() {
 	if it.deleted {
 		it.deleted = false
+		return
+	}
+	if it.isReverseIter { // Do we just want to call Prev() here?
 		return
 	}
 
@@ -124,6 +133,80 @@ retry:
 		it.curr = next
 	}
 
+	it.count++
+	if it.count%it.smrInterval == 0 {
+		it.Refresh()
+	}
+}
+
+func (s *Skiplist) NewPrevIterator(startLim, endLim unsafe.Pointer, cmp CompareFn, buf *ActionBuffer) *Iterator {
+	bs := s.barrier.Acquire()
+	itr := &Iterator{
+		cmp:           cmp,
+		s:             s,
+		buf:           buf,
+		smrInterval:   ^uint(0),
+		isReverseIter: true,
+		bs:            bs,
+	}
+	itr.s.findPath(endLim, cmp, buf, &itr.s.Stats)
+	/*This makes it so that the value is loaded when we call
+	NewPrevIterator(), We can avoid this by adding a sentinel node
+	that would point back to the tail node??
+	Or we disregard the node and consider it start inclusive, end exclusive??*/
+	itr.curr = buf.preds[0]
+	itr.valid = true
+	return itr
+}
+
+func (it *Iterator) Prev() {
+	if !it.isReverseIter { // Do we just want to call Next() here?
+		return
+	}
+	it.valid = true
+	anchor := int(atomic.LoadInt32(&it.s.level) - 1)
+	if it.buf.preds[anchor] == it.curr {
+		tempBuf := it.s.MakeBuf()
+		it.s.findPath(it.buf.preds[anchor].Item(), it.cmp, tempBuf, &it.s.Stats)
+		it.buf.preds[anchor] = tempBuf.preds[anchor]
+		it.s.FreeBuf(tempBuf)
+	} else {
+		for i := 1; i < anchor; i++ {
+			if it.buf.preds[i] != it.curr {
+				anchor = i
+				break
+			}
+		}
+	}
+
+	for i := anchor; i > 0; i-- {
+		curr := it.buf.preds[i]
+	levelsearch:
+		for {
+			nextNode, deleted := curr.getNext(i - 1)
+			for deleted {
+				/*Since we only have the effective Curr and not the prev,
+				we may just want to call FindPath to this item with a dummy buffer
+				and let it clean it up*/
+				tempBuf := it.s.MakeBuf()
+				it.s.findPath(curr.Item(), it.cmp, tempBuf, &it.s.Stats) // This would make it O(logn^2)?? (I think)
+				// Keep predecessor at level i (must have tower >= i for getNext(i-1))
+				it.buf.preds[i] = tempBuf.preds[i]
+				it.s.FreeBuf(tempBuf)
+
+				curr = it.buf.preds[i]
+				nextNode, deleted = curr.getNext(i - 1)
+			}
+			if nextNode == it.curr {
+				it.buf.preds[i-1] = curr
+				break levelsearch
+			}
+			curr = nextNode
+		}
+
+		it.prev = it.curr
+		it.curr = it.buf.preds[0]
+	}
 	it.count++
 	if it.count%it.smrInterval == 0 {
 		it.Refresh()
